@@ -1,0 +1,49 @@
+#cloud-config
+package_upgrade: true
+packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - libzbar0
+  - git
+
+runcmd:
+  # 克隆仓库
+  - cd /opt && git clone https://github.com/l41036406-del/xmu-rollcall-wechat-bot.git xmu-rollcall-wechat-bot
+  - chown -R azureuser:azureuser /opt/xmu-rollcall-wechat-bot
+
+  # 创建虚拟环境并安装依赖
+  - cd /opt/xmu-rollcall-wechat-bot
+  - sudo -u azureuser python3 -m venv .venv
+  - sudo -u azureuser bash -c 'source .venv/bin/activate && pip install --upgrade pip && pip install -e xmu-rollcall-cli/ && pip install -U xmulogin'
+
+  # 创建 systemd 服务
+  - cat > /etc/systemd/system/xmu-wechatbot.service << 'SERVICEEOF'
+[Unit]
+Description=XMU Rollcall WeChat Bot
+After=network.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/opt/xmu-rollcall-wechat-bot
+ExecStart=/opt/xmu-rollcall-wechat-bot/.venv/bin/python -m xmu_rollcall.wechat_bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+  # 创建一个启动脚本供用户手动执行首次登录
+  - cat > /home/azureuser/first-login.sh << 'SHEOF'
+#!/bin/bash
+cd /opt/xmu-rollcall-wechat-bot
+source .venv/bin/activate
+python -m xmu_rollcall.wechat_bot --login-only
+SHEOF
+  - chmod +x /home/azureuser/first-login.sh
+  - chown azureuser:azureuser /home/azureuser/first-login.sh
+
+  # 配置完成
+  - echo "DEPLOYMENT_COMPLETE" > /var/log/xmu-deploy-status
