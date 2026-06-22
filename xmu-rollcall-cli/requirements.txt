@@ -1,0 +1,6 @@
+requests>=2.31.0
+pycryptodome>=3.19.0
+xmulogin>=1.0.0
+wechatbot-sdk>=0.2.1
+pyzbar>=0.1.9
+pillow>=10.0.0

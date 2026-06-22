@@ -1,0 +1,4 @@
+interface:
+  display_name: "XMU Rollcall"
+  short_description: "在 skill 目录内维护 XMU 账号、切换账号并执行一次性签到"
+  default_prompt: "Use $manage-xmu-rollcall to bootstrap the local runtime, add or remove XMU accounts, switch the active account, inspect current rollcalls, and answer active sign-ins."

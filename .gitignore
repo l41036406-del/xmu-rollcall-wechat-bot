@@ -1,0 +1,5 @@
+.lazybot/
+xmu-rollcall-cli/.venv/
+.idea/
+__pycache__/
+.venv/

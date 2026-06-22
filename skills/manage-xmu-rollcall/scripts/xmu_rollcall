@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+skill_dir="$(cd "$script_dir/.." && pwd)"
+repo_dir="$(cd "$skill_dir/../.." && pwd)"
+venv_dir="$skill_dir/.venv"
+venv_python="$venv_dir/bin/python"
+
+json_error() {
+  local code="$1"
+  local message="$2"
+  cat <<EOF
+{
+  "ok": false,
+  "error": "$code",
+  "message": "$message"
+}
+EOF
+}
+
+if [ ! -d "$repo_dir/xmu-rollcall-cli/xmu_rollcall" ]; then
+  json_error "repo-not-found" "Unable to locate xmu-rollcall-cli next to this skill."
+  exit 1
+fi
+
+if [ "${1-}" = "bootstrap" ]; then
+  python_bin="${PYTHON_BIN:-python3}"
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    json_error "python-missing" "Unable to find Python. Install Python 3.9+ or set PYTHON_BIN."
+    exit 1
+  fi
+
+  if ! "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+    json_error "python-version" "Python 3.9 or newer is required."
+    exit 1
+  fi
+
+  if [ ! -x "$venv_python" ]; then
+    "$python_bin" -m venv "$venv_dir"
+  fi
+
+  "$venv_python" -m pip install --quiet --upgrade pip setuptools wheel
+  "$venv_python" -m pip install --quiet requests pycryptodome xmulogin
+
+  cat <<EOF
+{
+  "ok": true,
+  "action": "bootstrapped",
+  "skill_dir": "$skill_dir",
+  "repo_dir": "$repo_dir",
+  "python": "$venv_python"
+}
+EOF
+  exit 0
+fi
+
+if [ ! -x "$venv_python" ]; then
+  json_error "venv-missing" "Skill runtime is missing. Run scripts/xmu_rollcall bootstrap first."
+  exit 1
+fi
+
+exec "$venv_python" "$script_dir/xmu_rollcall_tool.py" "$@"

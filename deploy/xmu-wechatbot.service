@@ -1,0 +1,17 @@
+[Unit]
+Description=XMU Rollcall WeChat Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<your-user>
+WorkingDirectory=<repo-root>/xmu-rollcall-cli
+Environment=TZ=Asia/Shanghai
+EnvironmentFile=<env-file-path>/xmu-wechatbot.env
+ExecStart=<repo-root>/xmu-rollcall-cli/.venv/bin/python -m xmu_rollcall.wechat_bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

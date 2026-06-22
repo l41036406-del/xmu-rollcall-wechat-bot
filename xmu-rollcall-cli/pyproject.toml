@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xmu-rollcall-cli"
+dynamic = ["version"]
+description = "XMU WeChat Bot Bundle - Automated TronClass answering through WeChat commands"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    {name = "KrsMt", email = "krsmt0113@gmail.com"}
+]
+maintainers = [
+    {name = "KrsMt", email = "krsmt0113@gmail.com"}
+]
+keywords = ["xmu", "wechatbot", "tronclass", "rollcall", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Education",
+    "Topic :: Utilities",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+dependencies = [
+    "requests",
+    "pycryptodome",
+    "xmulogin",
+    "wechatbot-sdk",
+    "pyzbar",
+    "pillow",
+]
+
+[project.urls]
+Homepage = "https://github.com/l41036406-del/xmu-rollcall-wechat-bot"
+Repository = "https://github.com/l41036406-del/xmu-rollcall-wechat-bot"
+Issues = "https://github.com/KrsMt-0113/XMU-Rollcall-Bot/issues"
+Documentation = "https://github.com/KrsMt-0113/XMU-Rollcall-Bot/blob/main/README.md"
+
+[project.scripts]
+xmu-wechat-bot = "xmu_rollcall.wechat_bot:main"
+
+[tool.setuptools]
+packages = ["xmu_rollcall"]
+
+[tool.setuptools.dynamic]
+version = {attr = "xmu_rollcall.__version__"}
+
+[tool.setuptools.package-data]
+xmu_rollcall = ["py.typed"]
