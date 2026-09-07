@@ -302,6 +302,100 @@ def log_qr_signin(record: Dict[str, Any]) -> None:
         pass
 
 
+# ---- 二维码“线索”自动留档 ----
+#
+# 用途：二维码点名进行中时，把学生端能访问到的相关接口原始返回抓下来存到服务器，
+# 供之后离线分析“有没有不发照片就能拿到动态口令 data 的接口”。
+QR_PROBE_DIR = CONFIG_DIR / "qr_probe"
+_QR_PROBE_RECENT: set = set()
+
+_QR_PROBE_ENDPOINTS = [
+    ("GET", f"{BASE_URL}/api/rollcall/{{rid}}"),
+    ("GET", f"{BASE_URL}/api/rollcall/{{rid}}/student_rollcalls"),
+    ("GET", f"{BASE_URL}/api/rollcall/{{rid}}/detail"),
+    ("GET", f"{BASE_URL}/api/rollcall/{{rid}}/qr"),
+    ("GET", f"{BASE_URL}/api/rollcall/{{rid}}/qr_content"),
+]
+
+
+def _qr_probe_request(
+    session: requests.Session, method: str, url: str
+) -> Dict[str, Any]:
+    record: Dict[str, Any] = {"method": method, "url": url}
+    try:
+        response = session.request(
+            method, url, headers=DEFAULT_HEADERS, timeout=8, allow_redirects=True
+        )
+        record["status"] = response.status_code
+        record["final_url"] = response.url
+        record["content_type"] = response.headers.get("Content-Type", "")
+        body = response.text or ""
+        if len(body) > 6000:
+            body = body[:6000] + "...(truncated)"
+        record["body"] = body
+    except requests.RequestException as exc:
+        record["error"] = str(exc)[:500]
+    return record
+
+
+def capture_qr_probe(
+    session: requests.Session,
+    account: Dict[str, Any],
+    rollcall_id: int,
+    *,
+    known_content: Optional[str] = None,
+    known_parsed: Optional[Dict[str, Any]] = None,
+    trigger: str = "",
+) -> Optional[str]:
+    """把当前二维码点名的相关接口响应存成 JSON，返回文件路径（失败返回 None）。
+
+    每个（账号, 点名, 分钟）最多留一次，避免刷屏。
+    """
+    now = datetime.now(CHINA_TZ)
+    bucket = (
+        int(account.get("id") or 0),
+        int(rollcall_id or 0),
+        now.strftime("%Y%m%d%H%M"),
+    )
+    if bucket in _QR_PROBE_RECENT:
+        return None
+    try:
+        ensure_config_dir()
+        QR_PROBE_DIR.mkdir(parents=True, exist_ok=True)
+        rid = int(rollcall_id)
+        requests_list = [
+            _qr_probe_request(session, method, url_template.format(rid=rid))
+            for method, url_template in _QR_PROBE_ENDPOINTS
+        ]
+        record = {
+            "time": now.isoformat(timespec="seconds"),
+            "trigger": trigger,
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("name") or "",
+            "username_masked": _mask_username(account.get("username") or ""),
+            "rollcall_id": rid,
+            "known_content": known_content,
+            "known_parsed": known_parsed,
+            "endpoints": requests_list,
+        }
+        file_name = f"qr_probe_{rid}_{now.strftime('%Y%m%d_%H%M%S')}.json"
+        file_path = QR_PROBE_DIR / file_name
+        with open(file_path, "w", encoding="utf-8") as file_obj:
+            json.dump(record, file_obj, ensure_ascii=False, indent=2)
+        index_line = {
+            "file": str(file_path),
+            "time": record["time"],
+            "account_id": record["account_id"],
+            "rollcall_id": rid,
+        }
+        with open(CONFIG_DIR / "qr_probe_index.jsonl", "a", encoding="utf-8") as index_obj:
+            index_obj.write(json.dumps(index_line, ensure_ascii=False) + "\n")
+        _QR_PROBE_RECENT.add(bucket)
+        return str(file_path)
+    except Exception:
+        return None
+
+
 def _opencv_decode_qr(image_bytes: bytes) -> Optional[str]:
     """用 OpenCV 解码二维码，比 pyzbar 更耐实拍/倾斜/模糊。"""
     try:
@@ -477,11 +571,17 @@ class RollcallService:
                 message=f"当前状态为 {rollcall.status or 'unknown'}，未执行数字签到。",
             )
 
+        # 二维码点名进行中：先自动把相关接口响应留档，供之后分析是否有“不发照片”的口子
+        self.capture_qr_probe(
+            session,
+            rollcall.rollcall_id,
+            trigger="answer_unsupported",
+        )
         return AnswerOutcome(
             rollcall=rollcall,
             action="unsupported",
             success=False,
-            message="二维码签到暂不支持自动应答。",
+            message="二维码签到暂不支持自动应答（已自动保留接口线索供后续分析）。",
         )
 
     def _answer_number_rollcall(
@@ -812,6 +912,25 @@ class RollcallService:
     ) -> AnswerOutcome:
         """直接按二维码内容签到（rollcallId 由内容解析得出）。"""
         return self.answer_qr_rollcall_with_code(session, 0, qr_content)
+
+    def capture_qr_probe(
+        self,
+        session: requests.Session,
+        rollcall_id: int,
+        *,
+        known_content: Optional[str] = None,
+        known_parsed: Optional[Dict[str, Any]] = None,
+        trigger: str = "",
+    ) -> Optional[str]:
+        """把当前二维码点名的相关接口响应自动存到服务器，返回文件路径。"""
+        return capture_qr_probe(
+            session,
+            self.account,
+            rollcall_id,
+            known_content=known_content,
+            known_parsed=known_parsed,
+            trigger=trigger,
+        )
 
     def _submit_qr_answer(
         self, session: requests.Session, rollcall_id: int, data_value: str

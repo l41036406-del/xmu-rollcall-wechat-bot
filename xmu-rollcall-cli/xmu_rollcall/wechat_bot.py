@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -654,6 +655,8 @@ class XMUWeChatBotApp:
         self.pending_configs: Dict[str, PendingConfigState] = {}
         # 用户输入 /qr 后等待二维码照片：user_id -> {account, service, session}
         self.qr_ready: Dict[str, Dict[str, Any]] = {}
+        # /watchqr 二维码监测任务：user_id -> asyncio.Task
+        self.qr_watch_tasks: Dict[str, asyncio.Task[None]] = {}
         self.cron_task: Optional[asyncio.Task[None]] = None
 
     def restore_context_tokens(self) -> None:
@@ -756,6 +759,10 @@ class XMUWeChatBotApp:
         rollcall_id = int(parsed["rollcallId"])
         course_id = parsed.get("courseId")
         outcome = await asyncio.to_thread(service.answer_qr_content, session, qr_content)
+        # 把这次真实照片里的 data 与接口返回一并留档，方便对照找“免照片”口子
+        self._schedule_qr_capture(
+            service, session, rollcall_id, qr_content=qr_content, parsed=parsed, trigger="qr_photo"
+        )
         if outcome.success:
             self.qr_ready.pop(msg.user_id, None)
             lines = [
@@ -826,6 +833,10 @@ class XMUWeChatBotApp:
                 )
                 rollcall_id = int(parsed["rollcallId"])
                 course_id = parsed.get("courseId")
+                # 把真实照片里的 data 与接口返回留档，方便对照找“免照片”口子
+                self._schedule_qr_capture(
+                    service, session, rollcall_id, qr_content=qr_content, parsed=parsed, trigger="photo"
+                )
                 if outcome.success:
                     lines = [
                         "# 二维码签到成功",
@@ -927,6 +938,8 @@ class XMUWeChatBotApp:
             return await self._handle_answer(msg.user_id)
         if command in ("/qr", "/qrcode"):
             return await self._handle_qr_command(msg.user_id, command, parts)
+        if command == "/watchqr":
+            return await self._handle_watchqr(msg.user_id, parts)
         if command == "/cron":
             return await self._handle_cron(msg.user_id, parts)
         if command == "/refresh":
@@ -935,6 +948,10 @@ class XMUWeChatBotApp:
             cancelled = []
             if self.qr_ready.pop(msg.user_id, None) is not None:
                 cancelled.append("已退出二维码照片待命模式。")
+            watch_task = self.qr_watch_tasks.pop(msg.user_id, None)
+            if watch_task is not None:
+                watch_task.cancel()
+                cancelled.append("已停止二维码监测。")
             if msg.user_id in self.pending_configs:
                 self.pending_configs.pop(msg.user_id, None)
                 cancelled.append("已取消进行中的配置。")
@@ -1124,6 +1141,111 @@ class XMUWeChatBotApp:
             "请直接发送二维码点名的二维码照片，我会立即识别并签到。",
             "发送 /cancel 可退出待命。",
         ])
+
+    @staticmethod
+    def _schedule_qr_capture(
+        service: RollcallService,
+        session: Any,
+        rollcall_id: int,
+        qr_content: Optional[str] = None,
+        parsed: Optional[Dict[str, Any]] = None,
+        trigger: str = "photo",
+    ) -> None:
+        """后台异步抓取一次“二维码线索”，不影响主流程回复速度。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            asyncio.to_thread(
+                service.capture_qr_probe,
+                session,
+                rollcall_id,
+                known_content=qr_content,
+                known_parsed=parsed,
+                trigger=trigger,
+            )
+        )
+
+    async def _handle_watchqr(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
+        """/watchqr [分钟]：开始监测，碰到二维码点名自动保存接口线索。
+
+        适合“来不及操作”的场景：课上发一次 /watchqr，机器人每 20 秒查一次，
+        一旦发现二维码点名进行中，就把相关接口响应自动存到服务器。
+        """
+        if len(parts) >= 2 and parts[1].lower() in {"off", "stop", "cancel"}:
+            task = self.qr_watch_tasks.pop(user_id, None)
+            if task is not None:
+                task.cancel()
+                return "已停止二维码监测。"
+            return _format_error_markdown("没有进行中的监测", "当前没有二维码监测任务。")
+
+        minutes = 15
+        if len(parts) >= 2:
+            try:
+                minutes = int(parts[1])
+            except ValueError:
+                return _format_error_markdown("参数错误", "用法：/watchqr [分钟]，分钟为 1-120。")
+        if minutes < 1 or minutes > 120:
+            return _format_error_markdown("参数错误", "分钟需在 1-120 之间。")
+
+        account = await asyncio.to_thread(get_current_user_account, user_id)
+        if not account:
+            return _format_no_account_markdown()
+
+        old_task = self.qr_watch_tasks.pop(user_id, None)
+        if old_task is not None:
+            old_task.cancel()
+
+        task = asyncio.create_task(self._watch_qr_loop(user_id, minutes))
+        self.qr_watch_tasks[user_id] = task
+        return "\n".join([
+            "# 二维码监测中",
+            "",
+            f"- 每 20 秒自动检查一次，共 {minutes} 分钟。",
+            "- 一旦发现“二维码点名”进行中，会自动把相关接口响应存到服务器。",
+            "- 发送 /cancel 或 /watchqr off 可停止。",
+        ])
+
+    async def _watch_qr_loop(self, user_id: str, minutes: int) -> None:
+        deadline = time.monotonic() + minutes * 60
+        notified = False
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    account = await asyncio.to_thread(get_current_user_account, user_id)
+                    if not account:
+                        continue
+                    cache_key = build_user_session_cache_key(user_id, int(account["id"]))
+                    service = RollcallService(account, session_cache_key=cache_key)
+                    session = await asyncio.to_thread(service.get_session)
+                    rollcalls = await asyncio.to_thread(service.fetch_rollcalls, session)
+                    qr_rollcalls = [
+                        rc for rc in rollcalls
+                        if not rc.is_number and not rc.is_radar and not rc.is_expired
+                    ]
+                    for rc in qr_rollcalls:
+                        await asyncio.to_thread(
+                            service.capture_qr_probe,
+                            session,
+                            rc.rollcall_id,
+                            trigger="watchqr",
+                        )
+                    if qr_rollcalls and not notified:
+                        notified = True
+                        await self._send_user_messages(
+                            user_id,
+                            "检测到“二维码点名”进行中，已自动把接口线索存到服务器，之后可交给我分析。",
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await asyncio.sleep(20)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.qr_watch_tasks.pop(user_id, None)
 
     async def _handle_cron(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
         if len(parts) == 1:
