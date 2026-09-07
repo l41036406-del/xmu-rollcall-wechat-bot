@@ -267,6 +267,7 @@ def _format_help_markdown() -> str:
                     ["`/switch 1`", "切换账号"],
                     ["`/accounts`", "查看账号 ID"],
                     ["`/answer`", "查询并应答"],
+                    ["`/qr`", "待命，随后发送二维码照片签到"],
                     ["`/qrcode 二维码内容`", "用二维码内容签到"],
                     ["`/cron add 4 8:00`", "新增定时"],
                     ["`/cron del 2`", "删除任务"],
@@ -642,6 +643,8 @@ class XMUWeChatBotApp:
         self.bot = bot
         self.command_lock = asyncio.Lock()
         self.pending_configs: Dict[str, PendingConfigState] = {}
+        # 用户输入 /qr 后等待二维码照片：user_id -> {account, service, session}
+        self.qr_ready: Dict[str, Dict[str, Any]] = {}
         self.cron_task: Optional[asyncio.Task[None]] = None
 
     def restore_context_tokens(self) -> None:
@@ -698,7 +701,77 @@ class XMUWeChatBotApp:
             await self._reply_messages(msg, reply_payload)
 
     async def _handle_image(self, msg: Any) -> ReplyPayload:
-        """处理图片消息：尝试解码二维码并自动签到"""
+        """处理图片消息：若用户已用 /qr 进入“待命”状态则走快速通道，否则通用解码。"""
+        ready = self.qr_ready.get(msg.user_id)
+        if ready is not None:
+            return await self._handle_qr_image(msg, ready)
+        return await self._handle_image_generic(msg)
+
+    async def _handle_qr_image(self, msg: Any, ready: Dict[str, Any]) -> ReplyPayload:
+        """/qr 之后收到的照片：用预取好的会话快速解码并签到。"""
+        image_bytes = None
+        if hasattr(msg, "image") and callable(msg.image):
+            image_bytes = await msg.image()
+        elif hasattr(msg, "image_data"):
+            image_bytes = msg.image_data
+        elif hasattr(msg, "image"):
+            image_bytes = msg.image
+
+        if not image_bytes:
+            return _format_error_markdown("图片处理失败", "无法获取图片数据。")
+
+        service: RollcallService = ready["service"]
+        session = ready["session"]
+
+        try:
+            qr_content = await asyncio.to_thread(
+                RollcallService.decode_qr_image, image_bytes
+            )
+        except RuntimeError as exc:
+            return _format_error_markdown("二维码解码失败", str(exc))
+
+        if not qr_content:
+            return (
+                "没有在照片里找到二维码。\n"
+                "请重新发送清晰的二维码照片（机器人保持待命，无需再发 /qr）。"
+            )
+
+        parsed = RollcallService.parse_qr_content(qr_content)
+        if not (isinstance(parsed, dict) and parsed.get("rollcallId") is not None):
+            return (
+                "已识别到二维码，但内容不是畅课“二维码点名”的签到码：\n"
+                f"`{_escape_markdown(qr_content)}`\n\n"
+                "机器人保持待命，请重新发送正确的签到二维码照片。"
+            )
+
+        rollcall_id = int(parsed["rollcallId"])
+        course_id = parsed.get("courseId")
+        outcome = await asyncio.to_thread(service.answer_qr_content, session, qr_content)
+        if outcome.success:
+            self.qr_ready.pop(msg.user_id, None)
+            lines = [
+                "# 二维码签到成功",
+                "",
+                f"- 签到编号：`{rollcall_id}`",
+            ]
+            if course_id is not None:
+                lines.append(f"- 课程编号：`{course_id}`")
+            lines.append("> 提示：动态二维码会定期刷新，下次签到请重新发 /qr 再拍照。")
+            return "\n".join(lines)
+
+        # 失败保持待命，便于重拍
+        lines = [
+            "# 二维码签到失败",
+            "",
+            f"- 签到编号：`{rollcall_id}`",
+            f"- 原因：{outcome.message}",
+            "",
+            "机器人保持待命，可重新发送二维码照片重试；或发送 /cancel 退出。",
+        ]
+        return "\n".join(lines)
+
+    async def _handle_image_generic(self, msg: Any) -> ReplyPayload:
+        """通用图片处理：尝试解码二维码并自动签到"""
         try:
             image_bytes = None
             if hasattr(msg, "image") and callable(msg.image):
@@ -845,12 +918,22 @@ class XMUWeChatBotApp:
             return await self._handle_answer(msg.user_id)
         if command == "/qrcode":
             return await self._handle_qrcode(msg.user_id, parts)
+        if command == "/qr":
+            return await self._handle_qr_ready(msg.user_id)
         if command == "/cron":
             return await self._handle_cron(msg.user_id, parts)
         if command == "/refresh":
             return await self._handle_refresh(msg.user_id)
         if command == "/cancel":
-            return _format_error_markdown("没有进行中的配置", "当前无需取消。")
+            cancelled = []
+            if self.qr_ready.pop(msg.user_id, None) is not None:
+                cancelled.append("已退出二维码照片待命模式。")
+            if msg.user_id in self.pending_configs:
+                self.pending_configs.pop(msg.user_id, None)
+                cancelled.append("已取消进行中的配置。")
+            if not cancelled:
+                return _format_error_markdown("没有进行中的操作", "当前无需取消。")
+            return "\n".join(cancelled)
 
         return [
             _format_error_markdown("未知命令", parts[0]),
@@ -992,6 +1075,33 @@ class XMUWeChatBotApp:
             f"- 状态：**{status_text}**",
             f"- 内容：`{_escape_markdown(detail)}`",
             f"- 详情：{outcome.message}",
+        ])
+
+    async def _handle_qr_ready(self, user_id: str) -> ReplyPayload:
+        """进入“二维码照片待命”模式：预取会话，等用户发照片后秒级签到。"""
+        account = await asyncio.to_thread(get_current_user_account, user_id)
+        if not account:
+            return _format_no_account_markdown()
+
+        cache_key = build_user_session_cache_key(user_id, int(account["id"]))
+        service = RollcallService(account, session_cache_key=cache_key)
+        try:
+            session = await asyncio.to_thread(service.get_session)
+        except Exception as exc:
+            return _format_error_markdown("登录失败", str(exc))
+
+        self.qr_ready[user_id] = {
+            "account": account,
+            "service": service,
+            "session": session,
+        }
+        return "\n".join([
+            "# 二维码照片待命",
+            "",
+            f"- 账号：{_escape_markdown(service.display_name)}",
+            "",
+            "请直接发送二维码点名的二维码照片，我会立即识别并签到。",
+            "发送 /cancel 可退出待命。",
         ])
 
     async def _handle_cron(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:

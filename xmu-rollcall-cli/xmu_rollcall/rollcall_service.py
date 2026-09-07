@@ -801,6 +801,31 @@ class RollcallService:
             )
 
         if response.status_code == 200:
+            data = _safe_json(response)
+            # 会话过期时后端可能把请求 302 到统一认证登录页，最终返回 HTML 200，
+            # 此时不能当作签到成功
+            if "text" in data and len(data) == 1:
+                return AnswerOutcome(
+                    rollcall=_empty_rollcall(rollcall_id),
+                    action="failed",
+                    success=False,
+                    message="登录已过期，请先重新发送 /qr（或 /refresh）后再签到。",
+                    number_code=data_value,
+                    response_status=200,
+                    raw_data=data,
+                )
+            error_code = data.get("errorCode") or data.get("error_code") or data.get("code") or ""
+            if not isinstance(error_code, dict) and QR_ROLLCALL_ERROR_MESSAGES.get(str(error_code).upper()):
+                mapped_message = QR_ROLLCALL_ERROR_MESSAGES[str(error_code).upper()]
+                return AnswerOutcome(
+                    rollcall=_empty_rollcall(rollcall_id),
+                    action="failed",
+                    success=False,
+                    message=f"二维码签到失败：{mapped_message}",
+                    number_code=data_value,
+                    response_status=200,
+                    raw_data=data,
+                )
             return AnswerOutcome(
                 rollcall=_empty_rollcall(rollcall_id),
                 action="answered",

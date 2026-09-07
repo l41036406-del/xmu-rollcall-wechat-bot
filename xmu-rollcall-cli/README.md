@@ -34,13 +34,14 @@ python -m xmu_rollcall.wechat_bot
 - `/switch 账号ID`
 - `/accounts`
 - `/answer`
+- `/qr`：进入待命，随后发送二维码照片即可快速签到
 - `/qrcode 二维码内容`：用二维码内容签到；也可 `/qrcode rollcall_id 内容`
 - `/cron add 4 8:00`
 - `/refresh`
 - `/cancel`
 - `/help`
 
-直接把“二维码点名”的二维码照片发给机器人，也会自动解码并签到。
+直接把“二维码点名”的二维码照片发给机器人，也会自动解码并签到；用 `/qr` 先进入待命再发照片速度更快。
 
 ## 更简单的方式
 
