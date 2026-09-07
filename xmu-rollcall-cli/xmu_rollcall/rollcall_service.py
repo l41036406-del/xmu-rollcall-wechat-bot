@@ -897,17 +897,19 @@ class RollcallService:
                 )
             raw_data = data
 
-        log_qr_signin(
-            {
-                "event": "qr_signin",
-                "account_id": int(self.account.get("id") or 0),
-                "account_name": self.display_name,
-                "username_masked": _mask_username(self.account.get("username") or ""),
-                "rollcall_id": rollcall_id,
-                "success": bool(outcome.success),
-                "message": outcome.message,
-                "response_status": response_status,
-                "response": _truncate_for_log(raw_data),
-            }
-        )
+        # 只在失败时留日志，成功不写，减少无用记录与隐私数据落盘
+        if not outcome.success:
+            log_qr_signin(
+                {
+                    "event": "qr_signin",
+                    "account_id": int(self.account.get("id") or 0),
+                    "account_name": self.display_name,
+                    "username_masked": _mask_username(self.account.get("username") or ""),
+                    "rollcall_id": rollcall_id,
+                    "success": False,
+                    "message": outcome.message,
+                    "response_status": response_status,
+                    "response": _truncate_for_log(raw_data),
+                }
+            )
         return outcome
