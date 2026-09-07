@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import requests
 from xmulogin import xmulogin
 
-from .config import get_session_cache_path
+from .config import CONFIG_DIR, ensure_config_dir, get_session_cache_path
 from .utils import load_session, save_session, verify_session
 
 BASE_URL = "https://lnt.xmu.edu.cn"
@@ -268,6 +268,38 @@ QR_ROLLCALL_ERROR_MESSAGES = {
     "QR_ROLLCALL_INVALID_CREATE_TIME_HASH": "签到时间与二维码生成时间不一致，请重新扫描。",
     "QR_ROLLCALL_CODE_EXPIRED": "二维码已过期，请刷新后重新扫描。",
 }
+
+
+QR_SIGNIN_LOG_FILE = CONFIG_DIR / "qr_signin.jsonl"
+
+
+def _mask_username(username: str) -> str:
+    username = str(username or "")
+    if len(username) <= 2:
+        return "*" * len(username)
+    return username[0] + "*" * (len(username) - 2) + username[-1]
+
+
+def _truncate_for_log(value: Any, max_len: int = 2000) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) > max_len:
+        text = text[:max_len] + "...(truncated)"
+    return text
+
+
+def log_qr_signin(record: Dict[str, Any]) -> None:
+    """把二维码签到结果按 JSON Lines 追加到配置目录下，便于服务器端排查。"""
+    try:
+        ensure_config_dir()
+        record.setdefault("time", datetime.now(CHINA_TZ).isoformat(timespec="seconds"))
+        with open(QR_SIGNIN_LOG_FILE, "a", encoding="utf-8") as file_obj:
+            file_obj.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # 日志写入失败不能影响签到主流程
+        pass
 
 
 def _opencv_decode_qr(image_bytes: bytes) -> Optional[str]:
@@ -793,66 +825,89 @@ class RollcallService:
         try:
             response = session.put(answer_url, json=payload, headers=DEFAULT_HEADERS, timeout=15)
         except requests.RequestException as exc:
-            return AnswerOutcome(
+            outcome = AnswerOutcome(
                 rollcall=_empty_rollcall(rollcall_id),
                 action="failed",
                 success=False,
                 message=f"提交二维码签到失败：{exc}",
             )
-
-        if response.status_code == 200:
+            raw_data: Optional[Dict[str, Any]] = {"exception": str(exc)}
+            response_status: Optional[int] = None
+        else:
             data = _safe_json(response)
-            # 会话过期时后端可能把请求 302 到统一认证登录页，最终返回 HTML 200，
-            # 此时不能当作签到成功
-            if "text" in data and len(data) == 1:
-                return AnswerOutcome(
-                    rollcall=_empty_rollcall(rollcall_id),
-                    action="failed",
-                    success=False,
-                    message="登录已过期，请先重新发送 /qr（或 /refresh）后再签到。",
-                    number_code=data_value,
-                    response_status=200,
-                    raw_data=data,
-                )
-            error_code = data.get("errorCode") or data.get("error_code") or data.get("code") or ""
-            if not isinstance(error_code, dict) and QR_ROLLCALL_ERROR_MESSAGES.get(str(error_code).upper()):
-                mapped_message = QR_ROLLCALL_ERROR_MESSAGES[str(error_code).upper()]
-                return AnswerOutcome(
+            response_status = response.status_code
+            error_code = (
+                data.get("errorCode")
+                or data.get("error_code")
+                or data.get("code")
+                or ""
+            )
+            if isinstance(error_code, dict):
+                error_code = ""
+            error_key = str(error_code).upper()
+            mapped_message = QR_ROLLCALL_ERROR_MESSAGES.get(error_key)
+
+            if response.status_code == 200:
+                # 会话过期时后端可能把请求 302 到统一认证登录页，最终返回 HTML 200，
+                # 此时不能当作签到成功
+                if "text" in data and len(data) == 1:
+                    outcome = AnswerOutcome(
+                        rollcall=_empty_rollcall(rollcall_id),
+                        action="failed",
+                        success=False,
+                        message="登录已过期，请先重新发送 /qr（或 /refresh）后再签到。",
+                        number_code=data_value,
+                        response_status=200,
+                        raw_data=data,
+                    )
+                elif mapped_message:
+                    outcome = AnswerOutcome(
+                        rollcall=_empty_rollcall(rollcall_id),
+                        action="failed",
+                        success=False,
+                        message=f"二维码签到失败：{mapped_message}",
+                        number_code=data_value,
+                        response_status=200,
+                        raw_data=data,
+                    )
+                else:
+                    outcome = AnswerOutcome(
+                        rollcall=_empty_rollcall(rollcall_id),
+                        action="answered",
+                        success=True,
+                        message="二维码签到成功！",
+                        number_code=data_value,
+                        response_status=200,
+                    )
+            else:
+                if not mapped_message:
+                    mapped_message = (
+                        data.get("message")
+                        or data.get("msg")
+                        or f"HTTP {response.status_code}"
+                    )
+                outcome = AnswerOutcome(
                     rollcall=_empty_rollcall(rollcall_id),
                     action="failed",
                     success=False,
                     message=f"二维码签到失败：{mapped_message}",
                     number_code=data_value,
-                    response_status=200,
+                    response_status=response.status_code,
                     raw_data=data,
                 )
-            return AnswerOutcome(
-                rollcall=_empty_rollcall(rollcall_id),
-                action="answered",
-                success=True,
-                message="二维码签到成功！",
-                number_code=data_value,
-                response_status=200,
-            )
+            raw_data = data
 
-        data = _safe_json(response)
-        error_code = (
-            data.get("errorCode")
-            or data.get("error_code")
-            or data.get("code")
-            or ""
+        log_qr_signin(
+            {
+                "event": "qr_signin",
+                "account_id": int(self.account.get("id") or 0),
+                "account_name": self.display_name,
+                "username_masked": _mask_username(self.account.get("username") or ""),
+                "rollcall_id": rollcall_id,
+                "success": bool(outcome.success),
+                "message": outcome.message,
+                "response_status": response_status,
+                "response": _truncate_for_log(raw_data),
+            }
         )
-        if isinstance(error_code, dict):
-            error_code = ""
-        mapped_message = QR_ROLLCALL_ERROR_MESSAGES.get(str(error_code).upper())
-        if not mapped_message:
-            mapped_message = data.get("message") or data.get("msg") or f"HTTP {response.status_code}"
-        return AnswerOutcome(
-            rollcall=_empty_rollcall(rollcall_id),
-            action="failed",
-            success=False,
-            message=f"二维码签到失败：{mapped_message}",
-            number_code=data_value,
-            response_status=response.status_code,
-            raw_data=data,
-        )
+        return outcome
