@@ -263,23 +263,28 @@ def _format_help_markdown() -> str:
             _build_table(
                 ["指令", "说明"],
                 [
-                    ["`/conf`", "分步配置账号"],
-                    ["`/switch 1`", "切换账号"],
+                    ["`/conf`", "分步配置账号（学号、密码）"],
                     ["`/accounts`", "查看账号 ID"],
-                    ["`/answer`", "查询并应答"],
-                    ["`/qr`", "待命，随后发送二维码照片签到"],
-                    ["`/qrcode 二维码内容`", "用二维码内容签到"],
-                    ["`/cron add 4 8:00`", "新增定时"],
-                    ["`/cron del 2`", "删除任务"],
-                    ["`/cron off`", "清空全部"],
-                    ["`/refresh`", "清理登录缓存"],
-                    ["`/cancel`", "取消 `/conf`"],
+                    ["`/switch 1`", "切换账号"],
+                    ["`/answer`", "查询并自动签到（数字/雷达）"],
+                    ["`/qr`", "等二维码照片签到；`/qr 内容` 直接按内容签"],
+                    ["`/cron`", "定时签到，用法见下方示例"],
+                    ["`/refresh`", "重新登录（会话失效时用）"],
+                    ["`/cancel`", "取消当前操作"],
                 ],
             ),
             "",
-            "> `/conf` 后依次发送学号、密码。",
-            "> `/cron` 的星期使用 1-7，分别代表周一到周日。",
-            "> 简写 `/cron 4 8:00` 等同于新增一条任务。",
+            "> 直接把“二维码点名”的照片发给机器人也会自动签到，用 `/qr` 待命后再发最快。",
+            "",
+            "## /cron 定时任务示例",
+            "",
+            "- `/cron` — 查看当前全部定时",
+            "- `/cron add 4 8:00` — 新增：每周四 08:00 自动签到",
+            "- `/cron 4 8:00` — 简写，与上一条等价",
+            "- `/cron del 2` — 删除编号为 2 的定时",
+            "- `/cron off` — 清空全部定时",
+            "",
+            "> 星期用 1-7，分别代表周一至周日。",
         ]
     )
 
@@ -916,10 +921,8 @@ class XMUWeChatBotApp:
             return await self._handle_switch(msg.user_id, parts)
         if command == "/answer":
             return await self._handle_answer(msg.user_id)
-        if command == "/qrcode":
-            return await self._handle_qrcode(msg.user_id, parts)
-        if command == "/qr":
-            return await self._handle_qr_ready(msg.user_id)
+        if command in ("/qr", "/qrcode"):
+            return await self._handle_qr_command(msg.user_id, command, parts)
         if command == "/cron":
             return await self._handle_cron(msg.user_id, parts)
         if command == "/refresh":
@@ -1031,15 +1034,29 @@ class XMUWeChatBotApp:
             return _format_no_rollcall_markdown(account, queried_at)
         return _format_answer_messages(batch_result)
 
+    async def _handle_qr_command(self, user_id: str, command: str, parts: Sequence[str]) -> ReplyPayload:
+        """统一入口：/qr 与 /qrcode。
+
+        - `/qr`：进入照片待命
+        - `/qr 二维码内容`：直接按内容签到
+        - `/qrcode ...`：历史别名，同样可用
+        """
+        content = " ".join(parts[1:]).strip()
+        if not content:
+            if command == "/qrcode":
+                return _format_error_markdown("参数不足", "用法：/qr 二维码内容，或 /qr 后直接发送照片")
+            return await self._handle_qr_ready(user_id)
+        return await self._handle_qrcode(user_id, parts)
+
     async def _handle_qrcode(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
-        """手动提交二维码签到内容。
+        """按二维码内容直接签到。
 
         两种用法：
-          /qrcode 二维码内容            （rollcallId 由内容自动解析）
-          /qrcode rollcall_id 内容      （旧用法，显式指定签到编号）
+          /qr 二维码内容            （rollcallId 由内容自动解析）
+          /qr rollcall_id 内容      （显式指定签到编号）
         """
         if len(parts) < 2:
-            return _format_error_markdown("参数不足", "用法：/qrcode [rollcall_id] 二维码内容文本")
+            return _format_error_markdown("参数不足", "用法：/qr [rollcall_id] 二维码内容文本")
 
         rollcall_id = 0
         content_start = 1
