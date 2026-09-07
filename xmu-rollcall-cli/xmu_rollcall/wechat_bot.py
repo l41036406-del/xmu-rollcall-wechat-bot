@@ -267,7 +267,7 @@ def _format_help_markdown() -> str:
                     ["`/switch 1`", "切换账号"],
                     ["`/accounts`", "查看账号 ID"],
                     ["`/answer`", "查询并应答"],
-                    ["`/qrcode rollcall_id 内容`", "用二维码内容签到"],
+                    ["`/qrcode 二维码内容`", "用二维码内容签到"],
                     ["`/cron add 4 8:00`", "新增定时"],
                     ["`/cron del 2`", "删除任务"],
                     ["`/cron off`", "清空全部"],
@@ -735,7 +735,37 @@ class XMUWeChatBotApp:
             except Exception as exc:
                 return f"检测到二维码内容：\n`{qr_content}`\n\n登录失败：{exc}"
 
-            # 检查当前有哪些活跃的二维码签到
+            parsed = RollcallService.parse_qr_content(qr_content)
+
+            # 内容自带 rollcallId：直接按内容签到（更快，减少二维码过期的风险）
+            if isinstance(parsed, dict) and parsed.get("rollcallId") is not None:
+                outcome = await asyncio.to_thread(
+                    service.answer_qr_content, session, qr_content
+                )
+                rollcall_id = int(parsed["rollcallId"])
+                course_id = parsed.get("courseId")
+                if outcome.success:
+                    lines = [
+                        "# 二维码签到成功",
+                        "",
+                        f"- 签到编号：`{rollcall_id}`",
+                    ]
+                    if course_id is not None:
+                        lines.append(f"- 课程编号：`{course_id}`")
+                    lines.append("> 提示：动态二维码会定期刷新，若下次提示失败，请及时重新拍照。")
+                else:
+                    lines = [
+                        "# 二维码签到失败",
+                        "",
+                        f"- 签到编号：`{rollcall_id}`",
+                        f"- 原因：{outcome.message}",
+                        "",
+                        "> 动态二维码通常几分钟内就会过期。若提示“时间不一致/已过期”，",
+                        "> 请让老师重新展示二维码后立即把照片发给本机器人。",
+                    ]
+                return "\n".join(lines)
+
+            # 解析不出 rollcallId（例如内容是纯数字口令的二维码）：回退到遍历活跃签到
             try:
                 rollcalls = await asyncio.to_thread(service.fetch_rollcalls, session)
                 qr_rollcalls = [r for r in rollcalls
@@ -747,7 +777,7 @@ class XMUWeChatBotApp:
                 return (
                     f"检测到二维码内容：\n`{qr_content}`\n\n"
                     "当前没有活跃的二维码签到。\n"
-                    f"可用 /qrcode rollcall_id {qr_content} 手动提交。"
+                    f"可用 /qrcode 二维码内容 手动提交。"
                 )
 
             # 对每个活跃的二维码签到尝试提交
@@ -919,16 +949,22 @@ class XMUWeChatBotApp:
         return _format_answer_messages(batch_result)
 
     async def _handle_qrcode(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
-        """手动提交二维码签到内容，格式：/qrcode rollcall_id 内容"""
-        if len(parts) < 3:
-            return _format_error_markdown("参数不足", "用法：/qrcode rollcall_id 二维码内容文本")
+        """手动提交二维码签到内容。
 
-        try:
+        两种用法：
+          /qrcode 二维码内容            （rollcallId 由内容自动解析）
+          /qrcode rollcall_id 内容      （旧用法，显式指定签到编号）
+        """
+        if len(parts) < 2:
+            return _format_error_markdown("参数不足", "用法：/qrcode [rollcall_id] 二维码内容文本")
+
+        rollcall_id = 0
+        content_start = 1
+        if len(parts) >= 3 and parts[1].isdigit():
             rollcall_id = int(parts[1])
-        except ValueError:
-            return _format_error_markdown("参数错误", "rollcall_id 必须是数字。")
+            content_start = 2
 
-        qr_content = " ".join(parts[2:]).strip()
+        qr_content = " ".join(parts[content_start:]).strip()
         if not qr_content:
             return _format_error_markdown("参数错误", "二维码内容不能为空。")
 

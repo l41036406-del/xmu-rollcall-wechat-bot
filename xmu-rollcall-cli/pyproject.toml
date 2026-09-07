@@ -37,6 +37,7 @@ dependencies = [
     "wechatbot-sdk",
     "pyzbar",
     "pillow",
+    "opencv-python-headless>=4.8",
 ]
 
 [project.urls]

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -126,6 +128,191 @@ def _safe_json(response: requests.Response) -> Dict[str, Any]:
     except ValueError:
         text = (response.text or "").strip()
         return {"text": text[:500]} if text else {}
+
+
+# ---- 二维码内容解析 ----
+#
+# 畅课/TronClass 的“二维码点名”在学生端扫码时，会得到下面两种内容之一：
+#   1) JSON：{"courseId":..., "data":"...", "rollcallId":...}
+#   2) URL： 形如 https://c-mobile.xmu.edu.cn/j?p=0~%102eqk!3~xxxx!4~%108rgx
+# 其中 p 是一个按“索引~值”分段的紧凑编码。索引与字段名的对应关系、以及各值的
+# 编码规则，是通过逆向 c-mobile 前端 app.js（模块 84272）得到的：
+#   - 字段索引按字段名列表的下标 base36 编码：0..9,a(10)
+#   - 数值：值以控制符 \x10 开头，其后为 base36 编码；形如 A.B 的为浮点
+#   - 布尔/枚举：值以控制符 \x1a 开头，\x1a1=true、\x1a0=false
+#   - 字符串里若含原始分隔符 ~ 或 !，会被替换成 \x1f 或 \x1e
+_QR_FIELDS = [
+    "courseId", "activityId", "activityType", "data", "rollcallId",
+    "groupSetId", "accessCode", "action", "enableGroupRollcall",
+    "createUser", "joinCourse",
+]
+_QR_INDEX_FIELD = {str(i): name for i, name in enumerate(_QR_FIELDS)}
+# 兼容 index 的 base36 写法（10 -> "a"）
+_QR_INDEX_FIELD.update({format(i, "x") if i >= 10 else str(i): name
+                        for i, name in enumerate(_QR_FIELDS)})
+_QR_NUM_MARK = "\x10"          # 数值前缀
+_QR_BOOL_MARK = "\x1a"         # 布尔/枚举前缀
+_QR_BOOL_TRUE = "\x1a1"
+_QR_BOOL_FALSE = "\x1a0"
+_QR_ENUM_NAMES = {
+    chr(26) + format(i + 2, "x"): name
+    for i, name in enumerate(["classroom-exam", "feedback", "vote"])
+}
+_QR_ESC_TILDE = "\x1f"         # 编码前的 "~"
+_QR_ESC_BANG = "\x1e"          # 编码前的 "!"
+
+
+def _decode_qr_value(value: str) -> Any:
+    if value.startswith(_QR_BOOL_MARK):
+        if value == _QR_BOOL_TRUE:
+            return True
+        if value == _QR_BOOL_FALSE:
+            return False
+        return _QR_ENUM_NAMES.get(value, value)
+    if value.startswith(_QR_NUM_MARK):
+        digits = value[1:].split(".")
+        numbers = []
+        for part in digits:
+            if not part:
+                continue
+            try:
+                numbers.append(int(part, 36))
+            except ValueError:
+                pass
+        if not numbers:
+            return 0
+        if len(numbers) == 1:
+            return numbers[0]
+        return float(f"{numbers[0]}.{numbers[1]}")
+    return value.replace(_QR_ESC_TILDE, "~").replace(_QR_ESC_BANG, "!")
+
+
+def decode_qr_p_token(p_value: str) -> Dict[str, Any]:
+    """把 /j?p=... 的 p 值反序列化成字段字典。
+
+    入参应是 URL 解码后的字符串（控制符已还原）。例如图片扫码得到的
+    `p=0~%102eqk!3~...!4~%108rgx`，先经 parse_qs 自动解码后直接传入即可。
+    """
+    result: Dict[str, Any] = {}
+    if not p_value or not isinstance(p_value, str):
+        return result
+    for segment in p_value.split("!"):
+        if not segment:
+            continue
+        index, sep, value = segment.partition("~")
+        if not sep:
+            continue
+        field_name = _QR_INDEX_FIELD.get(index, index)
+        result[field_name] = _decode_qr_value(value)
+    return result
+
+
+def parse_qr_content(content: str) -> Optional[Dict[str, Any]]:
+    """解析扫码得到的原始文本，返回签到相关字段（courseId/data/rollcallId 等）。
+
+    支持 JSON 与 c-mobile 跳转 URL 两种格式；解析不出返回 None。
+    """
+    if not content or not isinstance(content, str):
+        return None
+    text = content.strip()
+    if not text:
+        return None
+
+    # 1) 直接是 JSON
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    # 2) URL 形式：c-mobile /j 或 /scanner-jumper，携带 p 或 _p
+    if "?" in text:
+        try:
+            query = urlparse(text).query
+        except ValueError:
+            query = text.split("?", 1)[1]
+        params = parse_qs(query)
+        if "_p" in params and params["_p"]:
+            try:
+                payload = json.loads(params["_p"][0])
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                return payload
+        if "p" in params and params["p"]:
+            decoded = decode_qr_p_token(params["p"][0])
+            if decoded:
+                return decoded
+
+    return None
+
+
+def _empty_rollcall(rollcall_id: int) -> "RollcallRecord":
+    """构造一个仅有 rollcall_id 的空记录，用于二维码签到返回。"""
+    return RollcallRecord(
+        course_title="", created_by_name="", department_name="",
+        is_expired=False, is_number=False, is_radar=False,
+        rollcall_id=rollcall_id, rollcall_status="", scored=False, status="",
+    )
+
+
+# 服务端二维码签到常见错误码 -> 中文提示（错误码来自 c-mobile 前端逆向）
+QR_ROLLCALL_ERROR_MESSAGES = {
+    "ROLLCALL_DEVICE_ALREADY_IN_USE": "该设备已被其他学生使用签到，请更换设备或稍后再试。",
+    "QR_ROLLCALL_UNKNOWN_STUDENT": "非本课程的学生无法签到，请先加入课程。",
+    "QR_ROLLCALL_ALREADY_CLOSED": "二维码签到已结束。",
+    "QR_ROLLCALL_NOT_FOUND": "找不到进行中的二维码签到。",
+    "QR_ROLLCALL_NO_REQUEST_DATA": "缺少签到参数。",
+    "QR_ROLLCALL_INVALID_QR_CREATE_TIME": "二维码时间验证失败，可能已刷新，请让老师重新展示二维码。",
+    "QR_ROLLCALL_INVALID_CREATE_TIME_HASH": "签到时间与二维码生成时间不一致，请重新扫描。",
+    "QR_ROLLCALL_CODE_EXPIRED": "二维码已过期，请刷新后重新扫描。",
+}
+
+
+def _opencv_decode_qr(image_bytes: bytes) -> Optional[str]:
+    """用 OpenCV 解码二维码，比 pyzbar 更耐实拍/倾斜/模糊。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+
+    candidates = [image]
+    # 照片常带 EXIF 旋转信息，补测 90/180/270 三个方向
+    rotated = image
+    for _ in range(3):
+        rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
+        candidates.append(rotated)
+
+    detector = cv2.QRCodeDetector()
+    for frame in candidates:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sources = [frame, gray]
+        for source in sources:
+            try:
+                value, points, _ = detector.detectAndDecode(source)
+            except cv2.error:
+                continue
+            if value:
+                return value
+            # 定位到但没读出：放大 2 倍重试（小图/模糊常见）
+            if points is not None and len(points) == 4:
+                scaled = cv2.resize(
+                    source, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC
+                )
+                try:
+                    value, _, _ = detector.detectAndDecode(scaled)
+                except cv2.error:
+                    continue
+                if value:
+                    return value
+    return None
 
 
 def _parse_float(value: Any) -> Optional[float]:
@@ -516,70 +703,131 @@ class RollcallService:
 
     @staticmethod
     def decode_qr_image(image_bytes: bytes) -> Optional[str]:
-        """解码二维码图片，返回内容文本。需安装 pyzbar + pillow。"""
+        """解码二维码图片，返回内容文本。
+
+        优先使用 pyzbar + pillow；读不出时自动回退到 OpenCV
+        （更耐实拍、倾斜、模糊的签到码照片）。
+        """
+        pyzbar_ready = False
         try:
             from PIL import Image
             from pyzbar.pyzbar import decode as qr_decode
         except ImportError:
-            raise RuntimeError("需要安装 pyzbar 和 pillow 库来解码二维码。")
+            pyzbar_ready = False
+        else:
+            pyzbar_ready = True
 
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-            decoded = qr_decode(img)
-            if decoded:
-                return decoded[0].data.decode("utf-8", errors="replace")
-            return None
-        except Exception as exc:
-            raise RuntimeError(f"二维码解码失败：{exc}") from exc
+        if pyzbar_ready:
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                for source in (img, img.convert("L")):
+                    try:
+                        decoded = qr_decode(source)
+                    except Exception:
+                        decoded = []
+                    if decoded:
+                        return decoded[0].data.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        content = _opencv_decode_qr(image_bytes)
+        if content:
+            return content
+
+        if not pyzbar_ready:
+            raise RuntimeError(
+                "解码二维码需要 pyzbar+pillow 或 opencv-python-headless，当前均未安装。"
+            )
+        return None
+
+    @staticmethod
+    def parse_qr_content(content: str) -> Optional[Dict[str, Any]]:
+        """解析扫码文本为签到字段字典，支持 JSON 与 /j?p= URL 两种格式。"""
+        return parse_qr_content(content)
 
     def answer_qr_rollcall_with_code(
         self, session: requests.Session, rollcall_id: int, qr_content: str
     ) -> AnswerOutcome:
-        """用解码出的二维码内容提交 QR 签到。"""
-        answer_url = f"{BASE_URL}/api/rollcall/{rollcall_id}/answer_qr_rollcall"
+        """用解码出的二维码内容提交 QR 签到。
 
+        二维码内容可能是 JSON，也可能是 c-mobile 的 /j?p= URL。方法会从内容里
+        解析出 rollcallId 与 data 后，调用服务端 PUT /api/rollcall/{id}/
+        answer_qr_rollcall 提交 {data, deviceId}。当调用方已显式传 rollcall_id
+        且内容解析不出 rollcallId 时，则按调用方传入的 id 提交。
+        """
+        parsed = parse_qr_content(qr_content)
+        data_value: Optional[str] = None
+        if isinstance(parsed, dict):
+            if parsed.get("rollcallId") is not None:
+                rollcall_id = int(parsed["rollcallId"])
+            if parsed.get("data") is not None:
+                data_value = str(parsed["data"])
+        if not data_value:
+            # 兼容旧用法：内容本身就是一个签到 token/口令
+            data_value = qr_content.strip()
+        if not rollcall_id:
+            return AnswerOutcome(
+                rollcall=_empty_rollcall(0),
+                action="failed",
+                success=False,
+                message="无法从二维码内容解析出签到编号 rollcallId。",
+            )
+
+        return self._submit_qr_answer(session, rollcall_id, data_value)
+
+    def answer_qr_content(
+        self, session: requests.Session, qr_content: str
+    ) -> AnswerOutcome:
+        """直接按二维码内容签到（rollcallId 由内容解析得出）。"""
+        return self.answer_qr_rollcall_with_code(session, 0, qr_content)
+
+    def _submit_qr_answer(
+        self, session: requests.Session, rollcall_id: int, data_value: str
+    ) -> AnswerOutcome:
+        answer_url = f"{BASE_URL}/api/rollcall/{rollcall_id}/answer_qr_rollcall"
         payload = {
+            "data": data_value,
             "deviceId": str(uuid.uuid4()),
-            "numberCode": qr_content.strip(),
         }
 
         try:
             response = session.put(answer_url, json=payload, headers=DEFAULT_HEADERS, timeout=15)
         except requests.RequestException as exc:
             return AnswerOutcome(
-                rollcall=RollcallRecord(
-                    course_title="", created_by_name="", department_name="",
-                    is_expired=False, is_number=False, is_radar=False,
-                    rollcall_id=rollcall_id, rollcall_status="", scored=False, status="",
-                ),
-                action="failed", success=False,
+                rollcall=_empty_rollcall(rollcall_id),
+                action="failed",
+                success=False,
                 message=f"提交二维码签到失败：{exc}",
             )
 
         if response.status_code == 200:
             return AnswerOutcome(
-                rollcall=RollcallRecord(
-                    course_title="", created_by_name="", department_name="",
-                    is_expired=False, is_number=False, is_radar=False,
-                    rollcall_id=rollcall_id, rollcall_status="", scored=False, status="",
-                ),
-                action="answered", success=True,
+                rollcall=_empty_rollcall(rollcall_id),
+                action="answered",
+                success=True,
                 message="二维码签到成功！",
-                number_code=qr_content.strip(),
+                number_code=data_value,
                 response_status=200,
             )
 
         data = _safe_json(response)
-        err_msg = data.get("message", data.get("error_code", f"HTTP {response.status_code}"))
+        error_code = (
+            data.get("errorCode")
+            or data.get("error_code")
+            or data.get("code")
+            or ""
+        )
+        if isinstance(error_code, dict):
+            error_code = ""
+        mapped_message = QR_ROLLCALL_ERROR_MESSAGES.get(str(error_code).upper())
+        if not mapped_message:
+            mapped_message = data.get("message") or data.get("msg") or f"HTTP {response.status_code}"
         return AnswerOutcome(
-            rollcall=RollcallRecord(
-                course_title="", created_by_name="", department_name="",
-                is_expired=False, is_number=False, is_radar=False,
-                rollcall_id=rollcall_id, rollcall_status="", scored=False, status="",
-            ),
-            action="failed", success=False,
-            message=f"二维码签到失败：{err_msg}",
-            number_code=qr_content.strip(),
+            rollcall=_empty_rollcall(rollcall_id),
+            action="failed",
+            success=False,
+            message=f"二维码签到失败：{mapped_message}",
+            number_code=data_value,
             response_status=response.status_code,
             raw_data=data,
         )

@@ -4,3 +4,5 @@ xmulogin>=1.0.0
 wechatbot-sdk>=0.2.1
 pyzbar>=0.1.9
 pillow>=10.0.0
+# 照片/倾斜/模糊二维码解码兜底（pyzbar 读不出时使用）
+opencv-python-headless>=4.8
