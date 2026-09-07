@@ -1,5 +1,0 @@
-# Azure Web App settings
-__azurite_db_*.json
-.venv/
-*.pyc
-__pycache__/

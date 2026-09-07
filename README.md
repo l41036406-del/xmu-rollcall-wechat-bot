@@ -1,104 +1,52 @@
-# XMU 微信签到机器人
+# XMU 微信签到机器人（阿里云 VPS）
 
-[使用效果图](docs/screenshot.jpg)
+这是一个常驻在 Linux VPS 上的微信机器人，用于通过微信指令查询并完成 TronClass 签到。
 
-机器人支持这些微信命令：
+支持的指令包括：
 
-- `/conf`：分步配置账号
-- `/switch 账号ID`
-- `/accounts`
-- `/answer`：查询并自动签到（数字/雷达）
-- `/qr`：等二维码照片签到；`/qr 二维码内容` 也可直接按内容签到
-- `/cron`：定时签到（示例见机器人 `/help`）
-- `/refresh`
-- `/cancel`
-- `/help`
+- `/conf`：配置学号和密码
+- `/accounts`、`/switch 账号ID`：管理多个账号
+- `/answer`：立即检查并自动完成数字或雷达签到
+- `/qr`：等待二维码照片后识别并签到；也可使用 `/qr 二维码内容`
+- `/cron`：管理定时签到任务
+- `/refresh`、`/cancel`、`/help`
 
-`/answer` 不会持续轮询 TronClass，而是在你发命令时即时查一次；如果成功，会把签到码或经纬度发回微信。机器人消息里的时间按中国时区 `UTC+8` 显示。
+## 阿里云 VPS 部署
 
-### 二维码签到怎么用（推荐）
-
-老师展示“二维码点名”的二维码时：
-
-1. 先给机器人发 `/qr`
-2. 再把二维码照片发给机器人
-3. 机器人会**立即**解码并签到（`/qr` 时已预取登录会话，识别更快）
-
-也可以直接把二维码照片发给机器人（自动识别），但 `/qr` + 照片的速度更快、结果更明确。若提示“已过期/时间不一致”，让老师重新展示二维码后再次 `/qr` + 照片即可。
-
-动态二维码通常几分钟内就会刷新，请尽量在扫码后马上把照片发出来。
-
-## 三步上手
-
-### 0. 服务器
-
-租用一个 Linux 服务器（推荐 Ubuntu 22.04），可以选择阿里云、腾讯云、Google Cloud 等。
-
-### 1. 初始化
+适用于 Ubuntu 22.04 或其他具有 Python 3.9+、systemd 的 Linux 发行版。
 
 ```bash
-git clone https://github.com/KrsMt-0113/xmu-rollcall-wechat-bot.git
-cd xmu-rollcall-helper
+git clone <你的仓库地址> xmu-rollcall-wechat-bot
+cd xmu-rollcall-wechat-bot
 bash scripts/bootstrap.sh
-```
-
-### 2. 先扫码登录一次
-
-```bash
 bash scripts/start-local.sh --login-only
-```
-
-看到登录链接后，用机器人微信号扫码。
-
-### 3. 装成后台服务
-
-```bash
 sudo bash scripts/install-systemd.sh
 ```
 
-看日志：
+首次运行 `--login-only` 后，按输出的链接用机器人微信号扫码。成功后，服务会自动以后台方式运行。
+
+## 日常维护
 
 ```bash
+# 服务状态
+sudo systemctl status xmu-wechatbot --no-pager -l
+
+# 实时日志
 sudo journalctl -u xmu-wechatbot -f
+
+# 更新已拉取的代码后，重新安装并重启
+bash scripts/bootstrap.sh
+sudo systemctl restart xmu-wechatbot
 ```
 
-## 微信里怎么用
+运行数据不在 Git 中：
 
-首次配置：
+- `.lazybot/xmu-wechatbot.env`：服务环境变量
+- `.lazybot/data/` 或 `~/.xmu_rollcall/`：微信登录凭证、账号配置和缓存
 
-1. 发送 `/conf`
-2. 按提示发送学号
-3. 按提示发送密码
-4. 发送 `/answer`
+更新代码时务必保留这些目录。
 
-如果配置多个账号：
+## 项目结构
 
-- 发送 `/accounts` 看账号列表
-- 发送 `/switch 2` 切换到 `ID=2`
-
-定时执行：
-
-- 发送 `/cron add 4 8:00` 新增一条任务，也兼容简写 `/cron 4 8:00`
-- 发送 `/cron` 查看当前全部计划
-- 发送 `/cron del 2` 删除 `ID=2` 的任务
-- 发送 `/cron off` 清空全部定时
-
-## 仓库里给你准备好的东西
-
-- [scripts/bootstrap.sh](scripts/bootstrap.sh)：一键建虚拟环境并安装
-- [scripts/start-local.sh](scripts/start-local.sh)：本地启动或首次扫码
-- [scripts/install-systemd.sh](scripts/install-systemd.sh)：一键安装 `systemd`
-
-## 目录说明
-
-运行后会自动生成：
-
-- `.lazybot/xmu-wechatbot.env`：运行环境变量
-- `.lazybot/data/`：微信凭证、XMU 登录缓存和账号映射
-- `xmu-rollcall-cli/.venv/`：项目虚拟环境
-
-## 高级手动部署
-
-如果你不想用懒人脚本，也可以看手动版：
-
-- [docs/ubuntu-wechatbot-deploy.md](docs/ubuntu-wechatbot-deploy.md)
+- `xmu-rollcall-cli/`：机器人程序
+- `scripts/`：VPS 初始化、前台登录与 systemd 安装脚本
