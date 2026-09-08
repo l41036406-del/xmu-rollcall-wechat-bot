@@ -838,16 +838,25 @@ class RollcallService:
         """解码二维码图片，返回内容文本。
 
         优先使用 pyzbar + pillow；读不出时自动回退到 OpenCV
-        （更耐实拍、倾斜、模糊的签到码照片）。
+        （更耐实拍、倾斜、模糊的签到码照片）。没有任何解码库时才抛错。
         """
         pyzbar_ready = False
         try:
             from PIL import Image
             from pyzbar.pyzbar import decode as qr_decode
-        except ImportError:
+        except Exception:
             pyzbar_ready = False
         else:
             pyzbar_ready = True
+
+        cv_ready = False
+        try:
+            import cv2  # noqa: F401
+            import numpy as np  # noqa: F401
+        except Exception:
+            cv_ready = False
+        else:
+            cv_ready = True
 
         if pyzbar_ready:
             try:
@@ -862,11 +871,12 @@ class RollcallService:
             except Exception:
                 pass
 
-        content = _opencv_decode_qr(image_bytes)
-        if content:
-            return content
+        if cv_ready:
+            content = _opencv_decode_qr(image_bytes)
+            if content:
+                return content
 
-        if not pyzbar_ready:
+        if not pyzbar_ready and not cv_ready:
             raise RuntimeError(
                 "解码二维码需要 pyzbar+pillow 或 opencv-python-headless，当前均未安装。"
             )

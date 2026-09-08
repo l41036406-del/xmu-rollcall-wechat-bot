@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -9,6 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 from zoneinfo import ZoneInfo
 
@@ -25,6 +27,7 @@ from .wechat_storage import (
     get_user_cron_schedules,
     get_user_accounts,
     list_user_cron_jobs,
+    list_wechat_user_ids,
     load_all_user_context_tokens,
     mark_user_cron_triggered,
     save_user_context_token,
@@ -40,6 +43,14 @@ CRON_POLL_INTERVAL_SECONDS = 20
 CRON_GRACE_SECONDS = 300
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 CRON_TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+# 网页上传照片的“交接目录”：website-image 把照片写到这里，机器人从这里取走处理。
+# 不设置该环境变量则完全不启动监听。
+INCOMING_PHOTO_DIR = os.environ.get("XMU_INCOMING_PHOTO_DIR", "").strip()
+INCOMING_POLL_SECONDS = 2
+INCOMING_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+# 如果只有一个微信用户，网页上传默认签该用户的当前账号；也可用环境变量显式指定。
+INCOMING_OWNER_USER = os.environ.get("XMU_INCOMING_OWNER_USER", "").strip()
 
 ReplyPayload = Union[str, List[str], None]
 
@@ -658,6 +669,7 @@ class XMUWeChatBotApp:
         # /watchqr 二维码监测任务：user_id -> asyncio.Task
         self.qr_watch_tasks: Dict[str, asyncio.Task[None]] = {}
         self.cron_task: Optional[asyncio.Task[None]] = None
+        self.incoming_task: Optional[asyncio.Task[None]] = None
 
     def restore_context_tokens(self) -> None:
         context_tokens = getattr(self.bot, "_context_tokens", None)
@@ -669,16 +681,24 @@ class XMUWeChatBotApp:
         self.restore_context_tokens()
         if self.cron_task is None:
             self.cron_task = asyncio.create_task(self._cron_loop())
+        if INCOMING_PHOTO_DIR and self.incoming_task is None:
+            self.incoming_task = asyncio.create_task(self._incoming_photo_loop())
 
     async def stop_background_tasks(self) -> None:
-        if self.cron_task is None:
-            return
-        self.cron_task.cancel()
-        try:
-            await self.cron_task
-        except asyncio.CancelledError:
-            pass
+        tasks = [self.cron_task, self.incoming_task]
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+        for task in tasks:
+            if task is None:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self.cron_task = None
+        self.incoming_task = None
 
     async def handle_message(self, msg: Any) -> None:
         text = (getattr(msg, "text", "") or "").strip()
@@ -1246,6 +1266,117 @@ class XMUWeChatBotApp:
             pass
         finally:
             self.qr_watch_tasks.pop(user_id, None)
+
+    # ---- 网页上传照片自动处理（website-image 交接目录）----
+
+    async def _incoming_photo_loop(self) -> None:
+        """扫描网页上传目录，新照片到达即用当前微信账号签到。"""
+        upload_dir = Path(INCOMING_PHOTO_DIR)
+        processed_dir = upload_dir / "processed"
+        while True:
+            try:
+                notices = await asyncio.to_thread(self._scan_incoming_photos, upload_dir, processed_dir)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                notices = []
+            for owner_id, text in notices:
+                try:
+                    await self._send_user_messages(owner_id, text)
+                except Exception:
+                    pass
+            await asyncio.sleep(INCOMING_POLL_SECONDS)
+
+    def _resolve_incoming_account(self) -> tuple:
+        """网页上传是匿名来源，固定签到“微信机器人当前使用的账号”。"""
+        owner_id = INCOMING_OWNER_USER
+        if not owner_id:
+            user_ids = list_wechat_user_ids()
+            owner_id = user_ids[0] if len(user_ids) == 1 else ""
+        if not owner_id:
+            return "", None
+        return owner_id, get_current_user_account(owner_id)
+
+    def _scan_incoming_photos(self, upload_dir: Path, processed_dir: Path) -> List[tuple]:
+        notices: List[tuple] = []
+        if not upload_dir.exists():
+            return notices
+        owner_id, account = self._resolve_incoming_account()
+        for path in sorted(upload_dir.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            if path.suffix.lower() not in INCOMING_IMAGE_EXTS:
+                continue
+            # 刚写入的文件可能还没写完：mtime 太新就等下一轮
+            try:
+                if time.time() - path.stat().st_mtime < 5:
+                    continue
+            except OSError:
+                continue
+
+            result = self._handle_incoming_photo(path, owner_id, account)
+            try:
+                result_path = upload_dir / (path.name + ".result.json")
+                result_path.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            # 移走图片，避免重复处理
+            try:
+                processed_dir.mkdir(exist_ok=True)
+                path.rename(processed_dir / path.name)
+            except OSError:
+                pass
+            if owner_id:
+                if result.get("ok"):
+                    notices.append((owner_id, "网页上传照片：✅ 签到成功。"))
+                else:
+                    notices.append((owner_id, f"网页上传照片：❌ {result.get('message', '处理失败')}"))
+        return notices
+
+    def _handle_incoming_photo(
+        self, path: Path, owner_id: str, account: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        base = {
+            "ok": False,
+            "time": datetime.now(CHINA_TZ).isoformat(timespec="seconds"),
+            "source": path.name,
+        }
+        if not account:
+            return {**base, "message": "未配置微信签到账号，无法处理网页上传。"}
+        try:
+            image_bytes = path.read_bytes()
+        except OSError as exc:
+            return {**base, "message": f"读取图片失败：{exc}"}
+
+        try:
+            content = RollcallService.decode_qr_image(image_bytes)
+        except Exception as exc:
+            return {**base, "message": f"解码失败：{exc}"}
+        if not content:
+            return {**base, "message": "未在图片中找到二维码。"}
+
+        parsed = RollcallService.parse_qr_content(content)
+        if not (isinstance(parsed, dict) and parsed.get("rollcallId") is not None):
+            return {**base, "message": "已识别到二维码，但不是畅课“二维码点名”的签到码。"}
+
+        rollcall_id = int(parsed["rollcallId"])
+        cache_key = build_user_session_cache_key(owner_id, int(account["id"]))
+        service = RollcallService(account, session_cache_key=cache_key)
+        try:
+            session = service.get_session()
+            outcome = service.answer_qr_content(session, content)
+        except Exception as exc:
+            return {**base, "rollcallId": rollcall_id, "message": f"签到提交异常：{exc}"}
+
+        return {
+            **base,
+            "ok": outcome.success,
+            "rollcallId": rollcall_id,
+            "message": outcome.message,
+        }
 
     async def _handle_cron(self, user_id: str, parts: Sequence[str]) -> ReplyPayload:
         if len(parts) == 1:

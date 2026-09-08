@@ -102,6 +102,12 @@ def get_user_accounts(user_id: str) -> List[Dict[str, Any]]:
     return list(user_config.get("accounts", []))
 
 
+def list_wechat_user_ids() -> List[str]:
+    """返回配置里所有微信用户 ID，供匿名网页上传定位“当前账号”使用。"""
+    config = load_wechat_bot_config()
+    return list(config.get("users", {}).keys())
+
+
 def get_user_account_by_id(user_id: str, account_id: int) -> Optional[Dict[str, Any]]:
     for account in get_user_accounts(user_id):
         if int(account.get("id", 0)) == int(account_id):
