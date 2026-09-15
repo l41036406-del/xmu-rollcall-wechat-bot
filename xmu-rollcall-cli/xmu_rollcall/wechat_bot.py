@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from zoneinfo import ZoneInfo
 
 from .config import CONFIG_DIR, ensure_config_dir
-from .rollcall_service import AnswerBatchResult, AnswerOutcome, RollcallService
+from .rollcall_service import AnswerBatchResult, AnswerOutcome, RollcallService, log_qr_signin
 from .utils import save_session
 from .wechat_storage import (
     add_or_update_user_account,
@@ -52,7 +52,68 @@ INCOMING_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 # 如果只有一个微信用户，网页上传默认签该用户的当前账号；也可用环境变量显式指定。
 INCOMING_OWNER_USER = os.environ.get("XMU_INCOMING_OWNER_USER", "").strip()
 
+# 图片在“提交签到之前”就失败时（解码失败、没找到二维码、内容不是二维码签到码等），
+# 把原始照片一并存下来，事后可以直接拿来复现。
+QR_FAIL_IMAGE_DIR = CONFIG_DIR / "qr_fail_images"
+QR_FAIL_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+
 ReplyPayload = Union[str, List[str], None]
+
+
+def _log_line(message: str) -> None:
+    """把诊断信息打到标准输出，systemd 会收进 journalctl。"""
+    print(f"[wechatbot] {message}", flush=True)
+
+
+def _mask_user_id(user_id: Any) -> str:
+    value = str(user_id or "")
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _guess_image_suffix(image_bytes: bytes) -> str:
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    if image_bytes[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return ".heic"
+    return ".jpg"
+
+
+def record_image_failure(
+    event: str,
+    *,
+    user_id: Any,
+    message: str,
+    extra: Optional[Dict[str, Any]] = None,
+    image_bytes: Optional[bytes] = None,
+) -> None:
+    """图片签到在提交之前失败时留一条记录（只在失败时写，成功不写）。"""
+    record: Dict[str, Any] = {
+        "event": event,
+        "user_masked": _mask_user_id(user_id),
+        "source": "wechat",
+        "success": False,
+        "message": message,
+    }
+    if extra:
+        record.update(extra)
+    if image_bytes:
+        record["image_bytes"] = len(image_bytes)
+        if len(image_bytes) <= QR_FAIL_IMAGE_MAX_BYTES:
+            try:
+                QR_FAIL_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(CHINA_TZ).strftime("%Y%m%d_%H%M%S")
+                file_path = QR_FAIL_IMAGE_DIR / f"{stamp}_{event}{_guess_image_suffix(image_bytes)}"
+                with open(file_path, "wb") as file_obj:
+                    file_obj.write(image_bytes)
+                record["image_file"] = str(file_path)
+            except OSError:
+                pass
+    log_qr_signin(record)
+    _log_line(f"图片处理失败[{event}] {message}")
 
 
 @dataclass
@@ -721,6 +782,12 @@ class XMUWeChatBotApp:
                 msg_type = getattr(msg, "type", "") or ""
                 is_image = getattr(msg, "is_image", False) or msg_type == "Image"
 
+                # 收到什么消息都记一行，方便判断“照片到底有没有到机器人”
+                _log_line(
+                    f"收到{'图片' if is_image else '文本'}消息 user={_mask_user_id(msg.user_id)}"
+                    + ("" if is_image else f" text={text[:40]}")
+                )
+
                 if is_image:
                     reply_payload = await self._handle_image(msg)
                 elif text:
@@ -750,6 +817,9 @@ class XMUWeChatBotApp:
             image_bytes = msg.image
 
         if not image_bytes:
+            record_image_failure(
+                "qr_no_image_data", user_id=msg.user_id, message="无法获取图片数据"
+            )
             return _format_error_markdown("图片处理失败", "无法获取图片数据。")
 
         service: RollcallService = ready["service"]
@@ -760,9 +830,21 @@ class XMUWeChatBotApp:
                 RollcallService.decode_qr_image, image_bytes
             )
         except RuntimeError as exc:
+            record_image_failure(
+                "qr_decode_error",
+                user_id=msg.user_id,
+                message=str(exc),
+                image_bytes=image_bytes,
+            )
             return _format_error_markdown("二维码解码失败", str(exc))
 
         if not qr_content:
+            record_image_failure(
+                "qr_not_found",
+                user_id=msg.user_id,
+                message="未在图片中找到二维码",
+                image_bytes=image_bytes,
+            )
             return (
                 "没有在照片里找到二维码。\n"
                 "请重新发送清晰的二维码照片（机器人保持待命，无需再发 /qr）。"
@@ -770,6 +852,13 @@ class XMUWeChatBotApp:
 
         parsed = RollcallService.parse_qr_content(qr_content)
         if not (isinstance(parsed, dict) and parsed.get("rollcallId") is not None):
+            record_image_failure(
+                "qr_not_rollcall",
+                user_id=msg.user_id,
+                message="二维码内容不含 rollcallId",
+                extra={"qr_content": qr_content, "parsed": parsed},
+                image_bytes=image_bytes,
+            )
             return (
                 "已识别到二维码，但内容不是畅课“二维码点名”的签到码：\n"
                 f"`{_escape_markdown(qr_content)}`\n\n"
@@ -796,6 +885,18 @@ class XMUWeChatBotApp:
             return "\n".join(lines)
 
         # 失败保持待命，便于重拍
+        record_image_failure(
+            "qr_submit_failed",
+            user_id=msg.user_id,
+            message=outcome.message,
+            extra={
+                "rollcall_id": rollcall_id,
+                "course_id": course_id,
+                "qr_content": qr_content,
+                "parsed": parsed,
+            },
+            image_bytes=image_bytes,
+        )
         lines = [
             "# 二维码签到失败",
             "",
@@ -818,6 +919,9 @@ class XMUWeChatBotApp:
                 image_bytes = msg.image
 
             if not image_bytes:
+                record_image_failure(
+                    "image_no_data", user_id=msg.user_id, message="无法获取图片数据"
+                )
                 return _format_error_markdown("图片处理失败", "无法获取图片数据。")
 
             # 解码二维码
@@ -826,14 +930,33 @@ class XMUWeChatBotApp:
                     RollcallService.decode_qr_image, image_bytes
                 )
             except RuntimeError as exc:
+                record_image_failure(
+                    "decode_error",
+                    user_id=msg.user_id,
+                    message=str(exc),
+                    image_bytes=image_bytes,
+                )
                 return _format_error_markdown("二维码解码失败", str(exc))
 
             if not qr_content:
+                record_image_failure(
+                    "qr_not_found",
+                    user_id=msg.user_id,
+                    message="未在图片中找到二维码",
+                    image_bytes=image_bytes,
+                )
                 return "未在图片中找到二维码。"
 
             # 获取用户账号，尝试自动签到
             account = await asyncio.to_thread(get_current_user_account, msg.user_id)
             if not account:
+                record_image_failure(
+                    "no_account",
+                    user_id=msg.user_id,
+                    message="未配置 TronClass 账号",
+                    extra={"qr_content": qr_content},
+                    image_bytes=image_bytes,
+                )
                 return f"检测到二维码内容：\n`{qr_content}`\n\n未配置 TronClass 账号，请先 /conf 配置。"
 
             cache_key = build_user_session_cache_key(msg.user_id, int(account["id"]))
@@ -842,6 +965,13 @@ class XMUWeChatBotApp:
             try:
                 session = await asyncio.to_thread(service.get_session)
             except Exception as exc:
+                record_image_failure(
+                    "login_failed",
+                    user_id=msg.user_id,
+                    message=f"登录失败：{exc}",
+                    extra={"qr_content": qr_content},
+                    image_bytes=image_bytes,
+                )
                 return f"检测到二维码内容：\n`{qr_content}`\n\n登录失败：{exc}"
 
             parsed = RollcallService.parse_qr_content(qr_content)
@@ -867,6 +997,18 @@ class XMUWeChatBotApp:
                         lines.append(f"- 课程编号：`{course_id}`")
                     lines.append("> 提示：动态二维码会定期刷新，若下次提示失败，请及时重新拍照。")
                 else:
+                    record_image_failure(
+                        "submit_failed",
+                        user_id=msg.user_id,
+                        message=outcome.message,
+                        extra={
+                            "rollcall_id": rollcall_id,
+                            "course_id": course_id,
+                            "qr_content": qr_content,
+                            "parsed": parsed,
+                        },
+                        image_bytes=image_bytes,
+                    )
                     lines = [
                         "# 二维码签到失败",
                         "",
@@ -887,6 +1029,13 @@ class XMUWeChatBotApp:
                 qr_rollcalls = []
 
             if not qr_rollcalls:
+                record_image_failure(
+                    "no_active_rollcall",
+                    user_id=msg.user_id,
+                    message="当前没有活跃的二维码签到",
+                    extra={"qr_content": qr_content, "parsed": parsed},
+                    image_bytes=image_bytes,
+                )
                 return (
                     f"检测到二维码内容：\n`{qr_content}`\n\n"
                     "当前没有活跃的二维码签到。\n"
@@ -911,6 +1060,9 @@ class XMUWeChatBotApp:
             ])
 
         except Exception as exc:
+            record_image_failure(
+                "image_exception", user_id=msg.user_id, message=str(exc)
+            )
             return _format_error_markdown("图片处理异常", str(exc))
 
     async def _reply_messages(self, msg: Any, payload: ReplyPayload) -> None:
@@ -1314,7 +1466,21 @@ class XMUWeChatBotApp:
             except OSError:
                 continue
 
+            _log_line(f"网页上传目录收到照片 {path.name}")
             result = self._handle_incoming_photo(path, owner_id, account)
+            if not result.get("ok"):
+                _log_line(f"网页上传处理失败 {path.name}：{result.get('message', '处理失败')}")
+                try:
+                    image_bytes = path.read_bytes()
+                except OSError:
+                    image_bytes = None
+                record_image_failure(
+                    "web_upload_failed",
+                    user_id=owner_id or "(未指定)",
+                    message=str(result.get("message", "处理失败")),
+                    extra={"source": path.name},
+                    image_bytes=image_bytes,
+                )
             try:
                 result_path = upload_dir / (path.name + ".result.json")
                 result_path.write_text(
