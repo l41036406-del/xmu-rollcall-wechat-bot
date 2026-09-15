@@ -779,8 +779,9 @@ class XMUWeChatBotApp:
 
             try:
                 # 检查是否为图片消息（二维码签到）
-                msg_type = getattr(msg, "type", "") or ""
-                is_image = getattr(msg, "is_image", False) or msg_type == "Image"
+                # SDK 的 IncomingMessage.type 是小写字符串："text"/"image"/"voice"/...
+                msg_type = str(getattr(msg, "type", "") or "").lower()
+                is_image = msg_type == "image" or bool(getattr(msg, "images", None))
 
                 # 收到什么消息都记一行，方便判断“照片到底有没有到机器人”
                 _log_line(
@@ -799,6 +800,32 @@ class XMUWeChatBotApp:
 
             await self._reply_messages(msg, reply_payload)
 
+    async def _extract_image_bytes(self, msg: Any) -> Optional[bytes]:
+        """取出消息里的原始图片字节。
+
+        wechatbot SDK 的图片走 CDN，必须用 bot.download(msg) 下载并解密；
+        另外保留 _context_token / image() 等旧写法的兼容分支。
+        """
+        download = getattr(self.bot, "download", None)
+        if callable(download):
+            try:
+                media = await download(msg)
+            except Exception as exc:
+                _log_line(f"下载图片失败：{exc}")
+                media = None
+            if media is not None and getattr(media, "type", "") == "image":
+                data = getattr(media, "data", None)
+                if data:
+                    return data
+
+        if hasattr(msg, "image") and callable(msg.image):
+            return await msg.image()
+        if getattr(msg, "image_data", None):
+            return msg.image_data
+        if getattr(msg, "image", None):
+            return msg.image
+        return None
+
     async def _handle_image(self, msg: Any) -> ReplyPayload:
         """处理图片消息：若用户已用 /qr 进入“待命”状态则走快速通道，否则通用解码。"""
         ready = self.qr_ready.get(msg.user_id)
@@ -808,13 +835,7 @@ class XMUWeChatBotApp:
 
     async def _handle_qr_image(self, msg: Any, ready: Dict[str, Any]) -> ReplyPayload:
         """/qr 之后收到的照片：用预取好的会话快速解码并签到。"""
-        image_bytes = None
-        if hasattr(msg, "image") and callable(msg.image):
-            image_bytes = await msg.image()
-        elif hasattr(msg, "image_data"):
-            image_bytes = msg.image_data
-        elif hasattr(msg, "image"):
-            image_bytes = msg.image
+        image_bytes = await self._extract_image_bytes(msg)
 
         if not image_bytes:
             record_image_failure(
@@ -910,13 +931,7 @@ class XMUWeChatBotApp:
     async def _handle_image_generic(self, msg: Any) -> ReplyPayload:
         """通用图片处理：尝试解码二维码并自动签到"""
         try:
-            image_bytes = None
-            if hasattr(msg, "image") and callable(msg.image):
-                image_bytes = await msg.image()
-            elif hasattr(msg, "image_data"):
-                image_bytes = msg.image_data
-            elif hasattr(msg, "image"):
-                image_bytes = msg.image
+            image_bytes = await self._extract_image_bytes(msg)
 
             if not image_bytes:
                 record_image_failure(
