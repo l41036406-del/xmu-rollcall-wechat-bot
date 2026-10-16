@@ -6,7 +6,7 @@ import math
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -100,23 +100,24 @@ class AnswerBatchResult:
     outcomes: List[AnswerOutcome]
 
 
-def find_number_code(data: Any, depth: int = 0, max_depth: int = 10) -> Optional[str]:
-    if depth > max_depth:
+def parse_utc_date(date_text: Any) -> Optional[str]:
+    """把接口返回的时间戳换算成 UTC 日期（timetable 接口的 rollcall_date 用的就是这个）。
+
+    服务端返回形如 ``2026-09-15T02:00:59Z``；个别情况下可能是带偏移量的写法。
+    拿到的是无时区的字符串时按 UTC 处理。
+    """
+    text = str(date_text or "").strip()
+    if not text:
         return None
-    if isinstance(data, dict):
-        number_code = data.get("number_code")
-        if number_code is not None:
-            return str(number_code)
-        for value in data.values():
-            nested_code = find_number_code(value, depth + 1, max_depth)
-            if nested_code:
-                return nested_code
-    elif isinstance(data, list):
-        for item in data:
-            nested_code = find_number_code(item, depth + 1, max_depth)
-            if nested_code:
-                return nested_code
-    return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date().isoformat()
 
 
 def _safe_json(response: requests.Response) -> Dict[str, Any]:
@@ -584,41 +585,81 @@ class RollcallService:
             message="二维码签到暂不支持自动应答（已自动保留接口线索供后续分析）。",
         )
 
+    def _fetch_number_code(
+        self,
+        session: requests.Session,
+        rollcall_id: int,
+    ) -> tuple:
+        """取数字签到码，返回 (code, 错误信息)。
+
+        服务端 1.80 之后 ``/api/rollcall/<id>/student_rollcalls`` 的 number_code 变成 null，
+        改用：先查签到详情拿 course_id + rollcall_time，再按 UTC 日期查 timetable_rollcalls。
+        只在响应里精确匹配本次签到 id，取不到就报错，绝不拿别的签到的码去提交。
+        """
+        try:
+            detail_response = session.get(
+                f"{BASE_URL}/api/rollcall/{rollcall_id}",
+                headers=session.headers,
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            return None, f"获取签到详情失败：{exc}"
+
+        if detail_response.status_code != 200:
+            return None, f"获取签到详情失败，HTTP {detail_response.status_code}"
+
+        detail = _safe_json(detail_response)
+        if not isinstance(detail, dict):
+            return None, "获取签到码失败：签到详情不是 JSON 对象。"
+
+        course_id = detail.get("course_id")
+        rollcall_date = parse_utc_date(detail.get("rollcall_time"))
+        if not course_id or not rollcall_date:
+            return None, "获取签到码失败：签到详情里缺少 course_id / rollcall_time。"
+
+        try:
+            code_response = session.get(
+                f"{BASE_URL}/api/timetable_rollcalls",
+                params={"course_ids": course_id, "rollcall_date": rollcall_date},
+                headers=session.headers,
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            return None, f"获取签到码失败：{exc}"
+
+        if code_response.status_code != 200:
+            return None, f"获取签到码失败，HTTP {code_response.status_code}"
+
+        code_data = _safe_json(code_response)
+        rollcalls = code_data.get("rollcalls") if isinstance(code_data, dict) else None
+        if not isinstance(rollcalls, list):
+            return None, "获取签到码失败：timetable 响应里没有 rollcalls 列表。"
+
+        for item in rollcalls:
+            if not isinstance(item, dict) or str(item.get("id")) != str(rollcall_id):
+                continue
+            number_code = item.get("number_code")
+            if number_code is None or str(number_code).strip() == "":
+                return None, "获取签到码失败：该签到的 number_code 为空。"
+            # 保持字符串形式，避免 0026 这类前导零被吃掉
+            return str(number_code), ""
+
+        return None, f"获取签到码失败：timetable 响应中没有签到 {rollcall_id}。"
+
     def _answer_number_rollcall(
         self,
         session: requests.Session,
         rollcall: RollcallRecord,
     ) -> AnswerOutcome:
-        code_url = f"{BASE_URL}/api/rollcall/{rollcall.rollcall_id}/student_rollcalls"
         answer_url = f"{BASE_URL}/api/rollcall/{rollcall.rollcall_id}/answer_number_rollcall"
 
-        try:
-            code_response = session.get(code_url, headers=session.headers, timeout=15)
-        except requests.RequestException as exc:
-            return AnswerOutcome(
-                rollcall=rollcall,
-                action="failed",
-                success=False,
-                message=f"获取签到码失败：{exc}",
-            )
-
-        if code_response.status_code != 200:
-            return AnswerOutcome(
-                rollcall=rollcall,
-                action="failed",
-                success=False,
-                message=f"获取签到码失败，HTTP {code_response.status_code}",
-                response_status=code_response.status_code,
-                raw_data=_safe_json(code_response),
-            )
-
-        number_code = find_number_code(_safe_json(code_response))
+        number_code, error_message = self._fetch_number_code(session, rollcall.rollcall_id)
         if not number_code:
             return AnswerOutcome(
                 rollcall=rollcall,
                 action="failed",
                 success=False,
-                message="获取签到码失败，响应中没有 number_code。",
+                message=error_message,
             )
 
         payload = {
